@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, io::Read};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha512};
@@ -274,6 +274,65 @@ impl Feldman {
         Ok(self.round == FeldmanRound::Reconstructed)
     }
 
+    pub fn mul_share(&self, pubkey: &[u8]) -> Result<Vec<u8>, FeldmanError> {
+        if self.scalar.is_none() {
+            return Err(FeldmanError::WrongRound);
+        }
+
+        let point = EdwardsPoint::from_bytes(pubkey.into());
+        if point.is_none().into() {
+            return Err(FeldmanError::InvalidData("invalid pubkey".to_string()));
+        }
+
+        let result = self.scalar.unwrap() * point.unwrap();
+        if result.is_identity().into() {
+            return Err(FeldmanError::InvalidData("invalid pubkey".to_string()));
+        }
+
+        return Ok(result.compress().to_bytes().to_vec());
+    }
+
+    pub fn combine_mul_share(&mut self, shares: Vec<&[u8]>, ids: &[usize]) -> Result<Vec<u8>, FeldmanError> {
+        if shares.len() != ids.len() {
+            return Err(FeldmanError::InvalidData("mismatch of shares and ids len".to_string()));
+        }
+
+        let mut points = HashMap::<usize, EdwardsPoint>::new();
+        for (i, share) in shares.iter().enumerate() {
+            let point = EdwardsPoint::from_bytes((*share).into());
+            if point.is_none().into() {
+                return Err(FeldmanError::InvalidData(format!("invalid pubkey for {}", ids[i]).to_string()));
+            }
+
+            points.insert(ids[i], point.unwrap());
+        }
+      
+        let mut reconstructed_sum = EdwardsPoint::generator();
+
+        for j in ids {
+            let mut num = Scalar::ONE;
+            let mut den = Scalar::ONE;
+
+            for k in ids {
+                if j != k {
+                    let j_scalar = Scalar::from(*j as u32);
+                    let k_scalar = Scalar::from(*k as u32);
+
+                    num *= k_scalar;
+                    den *= k_scalar - j_scalar;
+                }
+            }
+
+            let den_inv = den.invert();
+            let reconstructed_fragment = points[&j] * (num * den_inv);
+            reconstructed_sum += reconstructed_fragment;
+        }
+
+        self.public_key = reconstructed_sum;
+
+        return Ok(reconstructed_sum.compress().to_bytes().to_vec());
+    }
+
     pub fn public_key(&self) -> &EdwardsPoint {
         &self.public_key
     }
@@ -283,10 +342,3 @@ impl Feldman {
     }
 }
 
-fn reverse_scalar_bytes(in_bytes: &[u8], length: usize) -> Vec<u8> {
-    let mut out_bytes = vec![0u8; length];
-    for (i, &byte) in in_bytes.iter().rev().enumerate() {
-        out_bytes[i] = byte;
-    }
-    out_bytes
-}
