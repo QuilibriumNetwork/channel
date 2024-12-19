@@ -1,3 +1,4 @@
+use base64::prelude::*;
 use std::{collections::HashMap, io::Read};
 use rand::{CryptoRng, RngCore};
 use serde::{Deserialize, Serialize};
@@ -43,10 +44,39 @@ pub struct Feldman {
 }
 
 #[derive(Serialize, Deserialize)]
+pub struct FeldmanJson {
+    threshold: usize,
+    total: usize,
+    id: usize,
+    frags_for_counterparties: HashMap<usize, String>,
+    frags_from_counterparties: HashMap<usize, String>,
+    zkpok: Option<String>,
+    secret: String,
+    scalar: Option<String>,
+    generator: String,
+    public_key: String,
+    point: String,
+    random_commitment_point: Option<String>,
+    round: usize,
+    zkcommits_from_counterparties: HashMap<usize, String>,
+    points_from_counterparties: HashMap<usize, String>,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct FeldmanReveal {
     point: Vec<u8>,
     random_commitment_point: Vec<u8>,
     zk_pok: Vec<u8>,
+}
+
+pub fn vec_to_array<const N: usize>(v: Vec<u8>) -> Result<[u8; N], Box<dyn std::error::Error>> {
+  if v.len() != N {
+      return Err(format!("Invalid length: expected {}, got {}", N, v.len()).into());
+  }
+  
+  let mut arr: [u8; N] = [0u8; N];
+  arr.copy_from_slice(&v);
+  Ok(arr)
 }
 
 impl Feldman {
@@ -74,6 +104,117 @@ impl Feldman {
             zkcommits_from_counterparties: HashMap::new(),
             points_from_counterparties: HashMap::new(),
         }
+    }
+
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let feldman_json = FeldmanJson {
+            threshold: self.threshold,
+            total: self.total,
+            id: self.id,
+            frags_for_counterparties: self.frags_for_counterparties.iter()
+                .map(|(&k, v)| (k, BASE64_STANDARD.encode(v)))
+                .collect(),
+            frags_from_counterparties: self.frags_from_counterparties.iter()
+                .map(|(&k, v)| (k, BASE64_STANDARD.encode(v.to_bytes())))
+                .collect(),
+            zkpok: self.zkpok.as_ref().map(|s| BASE64_STANDARD.encode(s.to_bytes())),
+            secret: BASE64_STANDARD.encode(self.secret.to_bytes()),
+            scalar: self.scalar.as_ref().map(|s| BASE64_STANDARD.encode(s.to_bytes())),
+            generator: BASE64_STANDARD.encode(self.generator.compress().to_bytes()),
+            public_key: BASE64_STANDARD.encode(self.public_key.compress().to_bytes()),
+            point: BASE64_STANDARD.encode(self.point.compress().to_bytes()),
+            random_commitment_point: self.random_commitment_point.as_ref()
+                .map(|p| BASE64_STANDARD.encode(p.compress().to_bytes())),
+            round: self.round as usize,
+            zkcommits_from_counterparties: self.zkcommits_from_counterparties.iter()
+                .map(|(&k, v)| (k, BASE64_STANDARD.encode(v)))
+                .collect(),
+            points_from_counterparties: self.points_from_counterparties.iter()
+                .map(|(&k, v)| (k, BASE64_STANDARD.encode(v.compress().to_bytes())))
+                .collect(),
+        };
+
+        serde_json::to_string(&feldman_json)
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let feldman_json: FeldmanJson = serde_json::from_str(json)?;
+
+        let frags_for_counterparties = feldman_json.frags_for_counterparties.into_iter()
+            .map(|(k, v)| Ok((k, BASE64_STANDARD.decode(v)?)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let frags_from_counterparties = feldman_json.frags_from_counterparties.into_iter()
+            .map(|(k, v)| {
+                let bytes = BASE64_STANDARD.decode(v)?;
+                Ok((k, Scalar::from_bytes(&vec_to_array::<56>(bytes)?)))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let mut zkpok: Option<Scalar> = None;
+        if feldman_json.zkpok.is_some() {
+            let bytes = BASE64_STANDARD.decode(feldman_json.zkpok.unwrap())?;
+            zkpok = Some(Scalar::from_bytes(&vec_to_array::<56>(bytes)?));
+        }
+
+        let secret_bytes = BASE64_STANDARD.decode(feldman_json.secret)?;
+        let secret = Scalar::from_bytes(&vec_to_array::<56>(secret_bytes)?);
+
+        let mut scalar: Option<Scalar> = None;
+        if feldman_json.scalar.is_some() {
+            let bytes = BASE64_STANDARD.decode(feldman_json.scalar.unwrap())?;
+            scalar = Some(Scalar::from_bytes(&vec_to_array::<56>(bytes)?));
+        }
+
+        let generator_bytes = BASE64_STANDARD.decode(feldman_json.generator)?;
+        let generator = EdwardsPoint::from_bytes(&vec_to_array::<57>(generator_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+
+        let public_key_bytes = BASE64_STANDARD.decode(feldman_json.public_key)?;
+        let public_key = EdwardsPoint::from_bytes(&vec_to_array::<57>(public_key_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+
+        let point_bytes = BASE64_STANDARD.decode(feldman_json.point)?;
+        let point = EdwardsPoint::from_bytes(&vec_to_array::<57>(point_bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?;
+
+        let mut random_commitment_point: Option<EdwardsPoint> = None;
+        if feldman_json.random_commitment_point.is_some() {
+            let bytes = BASE64_STANDARD.decode(feldman_json.random_commitment_point.unwrap())?;
+            random_commitment_point = Some(EdwardsPoint::from_bytes(&vec_to_array::<57>(bytes)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?);
+        }
+
+        let zkcommits_from_counterparties = feldman_json.zkcommits_from_counterparties.into_iter()
+            .map(|(k, v)| Ok((k, BASE64_STANDARD.decode(v)?)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let points_from_counterparties = feldman_json.points_from_counterparties.into_iter()
+            .map(|(k, v)| {
+                Ok((k, EdwardsPoint::from_bytes(&vec_to_array::<57>(BASE64_STANDARD.decode(v)?)?.into()).into_option().ok_or_else(|| FeldmanError::InvalidData("invalid data".into()))?))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        Ok(Feldman {
+            threshold: feldman_json.threshold,
+            total: feldman_json.total,
+            id: feldman_json.id,
+            frags_for_counterparties,
+            frags_from_counterparties,
+            zkpok,
+            secret,
+            scalar,
+            generator,
+            public_key,
+            point,
+            random_commitment_point,
+            round: match feldman_json.round {
+              0 => FeldmanRound::Uninitialized,
+              1 => FeldmanRound::Initialized,
+              2 => FeldmanRound::Committed,
+              3 => FeldmanRound::Revealed,
+              4 => FeldmanRound::Reconstructed,
+              _ => FeldmanRound::Uninitialized,
+            },
+            zkcommits_from_counterparties,
+            points_from_counterparties,
+        })
     }
 
     pub fn set_id(&mut self, id: usize) {

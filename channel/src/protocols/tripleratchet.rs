@@ -1,20 +1,20 @@
+use base64::prelude::*;
 use std::collections::HashMap;
-use std::hash::Hash;
 use ed448_goldilocks_plus::elliptic_curve::group::GroupEncoding;
 use ed448_goldilocks_plus::elliptic_curve::Group;
 use rand::rngs::OsRng;
 use rand::{CryptoRng, RngCore};
 use sha2::{Sha512, Digest};
 use hkdf::Hkdf;
-use aes_gcm::{Aes256Gcm, Key, KeyInit, Nonce};
+use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
-use ed448_goldilocks_plus::{subtle, CompressedEdwardsY, EdwardsPoint, Scalar};
+use ed448_goldilocks_plus::{subtle, EdwardsPoint, Scalar};
 use serde::{Serialize, Deserialize};
 use thiserror::Error;
 use subtle::ConstantTimeEq;
 
-use super::doubleratchet::{DoubleRatchetParticipant, MessageCiphertext, P2PChannelEnvelope};
-use super::feldman::{Feldman, FeldmanReveal};
+use super::doubleratchet::{DoubleRatchetParticipant, DoubleRatchetParticipantJson, MessageCiphertext, P2PChannelEnvelope};
+use super::feldman::{Feldman, vec_to_array, FeldmanReveal};
 use super::x3dh::{receiver_x3dh, sender_x3dh};
 
 const TRIPLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
@@ -73,6 +73,41 @@ pub struct TripleRatchetParticipant {
     should_dkg_ratchet: HashMap<Vec<u8>, bool>,
     async_dkg_pubkey: Option<EdwardsPoint>,
     threshold: usize,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct PeerInfoJson {
+    public_key: String,
+    identity_public_key: String,
+    signed_pre_public_key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct TripleRatchetParticipantJson {
+  peer_key: String,
+  sending_ephemeral_private_key: String,
+  receiving_ephemeral_keys: HashMap<String, String>,
+  receiving_group_key: Option<String>,
+  root_key: String,
+  sending_chain_key: String,
+  current_header_key: String,
+  next_header_key: String,
+  receiving_chain_key: HashMap<String, String>,
+  current_sending_chain_length: u32,
+  previous_sending_chain_length: u32,
+  current_receiving_chain_length: HashMap<String, u32>,
+  previous_receiving_chain_length: HashMap<String, u32>,
+  peer_id_map: HashMap<String, usize>,
+  id_peer_map: HashMap<usize, PeerInfoJson>,
+  skipped_keys_map: HashMap<String, HashMap<String, HashMap<u32, String>>>,
+  peer_channels: HashMap<String, String>,
+  dkg_ratchet: String,
+  next_dkg_ratchet: String,
+  async_dkg_ratchet: bool,
+  should_ratchet: bool,
+  should_dkg_ratchet: HashMap<String, bool>,
+  async_dkg_pubkey: Option<String>,
+  threshold: usize,
 }
 
 impl TripleRatchetParticipant {
@@ -190,6 +225,182 @@ impl TripleRatchetParticipant {
         Ok((participant, init_messages))
     }
 
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let triple_ratchet_json = TripleRatchetParticipantJson {
+            peer_key: BASE64_STANDARD.encode(self.peer_key.to_bytes()),
+            sending_ephemeral_private_key: BASE64_STANDARD.encode(self.sending_ephemeral_private_key.to_bytes()),
+            receiving_ephemeral_keys: self.receiving_ephemeral_keys.iter()
+                .map(|(k, v)| (BASE64_STANDARD.encode(k), BASE64_STANDARD.encode(v.to_bytes())))
+                .collect(),
+            receiving_group_key: self.receiving_group_key.as_ref().map(|k| BASE64_STANDARD.encode(k)),
+            root_key: BASE64_STANDARD.encode(&self.root_key),
+            sending_chain_key: BASE64_STANDARD.encode(&self.sending_chain_key),
+            current_header_key: BASE64_STANDARD.encode(&self.current_header_key),
+            next_header_key: BASE64_STANDARD.encode(&self.next_header_key),
+            receiving_chain_key: self.receiving_chain_key.iter()
+                .map(|(k, v)| (BASE64_STANDARD.encode(k), BASE64_STANDARD.encode(v)))
+                .collect(),
+            current_sending_chain_length: self.current_sending_chain_length,
+            previous_sending_chain_length: self.previous_sending_chain_length,
+            current_receiving_chain_length: self.current_receiving_chain_length.iter()
+                .map(|(k, &v)| (BASE64_STANDARD.encode(k), v))
+                .collect(),
+            previous_receiving_chain_length: self.previous_receiving_chain_length.iter()
+                .map(|(k, &v)| (BASE64_STANDARD.encode(k), v))
+                .collect(),
+            peer_id_map: self.peer_id_map.iter()
+                .map(|(k, &v)| (BASE64_STANDARD.encode(k), v))
+                .collect(),
+            id_peer_map: self.id_peer_map.iter()
+                .map(|(&k, v)| (k, PeerInfoJson {
+                    public_key: BASE64_STANDARD.encode(&v.public_key),
+                    identity_public_key: BASE64_STANDARD.encode(&v.identity_public_key),
+                    signed_pre_public_key: BASE64_STANDARD.encode(&v.signed_pre_public_key),
+                }))
+                .collect(),
+            skipped_keys_map: self.skipped_keys_map.iter()
+                .map(|(k1, v1)| (BASE64_STANDARD.encode(k1),
+                    v1.iter().map(|(k2, v2)| (BASE64_STANDARD.encode(k2),
+                        v2.iter().map(|(&k3, v3)| (k3, BASE64_STANDARD.encode(v3)))
+                        .collect()))
+                    .collect()))
+                .collect(),
+            peer_channels: self.peer_channels.iter()
+                .map(|(k, v)| Ok((BASE64_STANDARD.encode(k), v.to_json()?)))
+                .collect::<Result<HashMap<_, _>, serde_json::Error>>()?,
+            dkg_ratchet: self.dkg_ratchet.to_json()?,
+            next_dkg_ratchet: self.next_dkg_ratchet.to_json()?,
+            async_dkg_ratchet: self.async_dkg_ratchet,
+            should_ratchet: self.should_ratchet,
+            should_dkg_ratchet: self.should_dkg_ratchet.iter()
+                .map(|(k, &v)| (BASE64_STANDARD.encode(k), v))
+                .collect(),
+            async_dkg_pubkey: self.async_dkg_pubkey.as_ref()
+                .map(|p| BASE64_STANDARD.encode(p.compress().to_bytes())),
+            threshold: self.threshold,
+        };
+
+        serde_json::to_string(&triple_ratchet_json)
+    }
+
+    pub fn from_json(json: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let triple_ratchet_json: TripleRatchetParticipantJson = serde_json::from_str(json)?;
+
+        let peer_key_bytes = BASE64_STANDARD.decode(&triple_ratchet_json.peer_key)?;
+        let peer_key = Scalar::from_bytes(&vec_to_array::<56>(peer_key_bytes)?);
+
+        let sending_ephemeral_private_key_bytes = BASE64_STANDARD.decode(&triple_ratchet_json.sending_ephemeral_private_key)?;
+        let sending_ephemeral_private_key = Scalar::from_bytes(&vec_to_array::<56>(sending_ephemeral_private_key_bytes)?);
+
+        let receiving_ephemeral_keys = triple_ratchet_json.receiving_ephemeral_keys.into_iter()
+            .map(|(k, v)| {
+                let key = BASE64_STANDARD.decode(k)?;
+                let value_bytes = BASE64_STANDARD.decode(v)?;
+                let value = Scalar::from_bytes(&vec_to_array::<56>(value_bytes)?);
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let receiving_group_key = triple_ratchet_json.receiving_group_key
+            .map(|k| BASE64_STANDARD.decode(k))
+            .transpose()?;
+
+        let root_key = BASE64_STANDARD.decode(&triple_ratchet_json.root_key)?;
+        let sending_chain_key = BASE64_STANDARD.decode(&triple_ratchet_json.sending_chain_key)?;
+        let current_header_key = BASE64_STANDARD.decode(&triple_ratchet_json.current_header_key)?;
+        let next_header_key = BASE64_STANDARD.decode(&triple_ratchet_json.next_header_key)?;
+
+        let receiving_chain_key = triple_ratchet_json.receiving_chain_key.into_iter()
+            .map(|(k, v)| {
+                let key = BASE64_STANDARD.decode(k)?;
+                let value = BASE64_STANDARD.decode(v)?;
+                Ok((key, value))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let current_receiving_chain_length = triple_ratchet_json.current_receiving_chain_length.into_iter()
+            .map(|(k, v)| Ok((BASE64_STANDARD.decode(k)?, v)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let previous_receiving_chain_length = triple_ratchet_json.previous_receiving_chain_length.into_iter()
+            .map(|(k, v)| Ok((BASE64_STANDARD.decode(k)?, v)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let peer_id_map = triple_ratchet_json.peer_id_map.into_iter()
+            .map(|(k, v)| Ok((BASE64_STANDARD.decode(k)?, v)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let id_peer_map = triple_ratchet_json.id_peer_map.into_iter()
+            .map(|(k, v)| Ok((k, PeerInfo {
+                public_key: BASE64_STANDARD.decode(&v.public_key)?,
+                identity_public_key: BASE64_STANDARD.decode(&v.identity_public_key)?,
+                signed_pre_public_key: BASE64_STANDARD.decode(&v.signed_pre_public_key)?,
+            })))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let skipped_keys_map = triple_ratchet_json.skipped_keys_map.into_iter()
+            .map(|(k1, v1)| {
+                let key1 = BASE64_STANDARD.decode(k1)?;
+                let value1 = v1.into_iter()
+                    .map(|(k2, v2)| {
+                        let key2 = BASE64_STANDARD.decode(k2)?;
+                        let value2 = v2.into_iter()
+                            .map(|(k3, v3)| Ok((k3, BASE64_STANDARD.decode(v3)?)))
+                            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+                        Ok((key2, value2))
+                    })
+                    .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+                Ok((key1, value1))
+            })
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let peer_channels = triple_ratchet_json.peer_channels.into_iter()
+            .map(|(k, v)| Ok((BASE64_STANDARD.decode(k)?, DoubleRatchetParticipant::from_json(v)?)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let dkg_ratchet = Feldman::from_json(&triple_ratchet_json.dkg_ratchet)?;
+        let next_dkg_ratchet = Feldman::from_json(&triple_ratchet_json.next_dkg_ratchet)?;
+
+        let should_dkg_ratchet = triple_ratchet_json.should_dkg_ratchet.into_iter()
+            .map(|(k, v)| Ok((BASE64_STANDARD.decode(k)?, v)))
+            .collect::<Result<HashMap<_, _>, Box<dyn std::error::Error>>>()?;
+
+        let mut async_dkg_pubkey: Option<EdwardsPoint> = None;
+
+        if triple_ratchet_json.async_dkg_pubkey.is_some() {
+            let bytes = BASE64_STANDARD.decode(triple_ratchet_json.async_dkg_pubkey.unwrap())?;
+            let point = EdwardsPoint::from_bytes(&vec_to_array::<57>(bytes)?.into());
+            async_dkg_pubkey = point.into_option();
+        }
+
+        Ok(TripleRatchetParticipant {
+            peer_key,
+            sending_ephemeral_private_key,
+            receiving_ephemeral_keys,
+            receiving_group_key,
+            root_key,
+            sending_chain_key,
+            current_header_key,
+            next_header_key,
+            receiving_chain_key,
+            current_sending_chain_length: triple_ratchet_json.current_sending_chain_length,
+            previous_sending_chain_length: triple_ratchet_json.previous_sending_chain_length,
+            current_receiving_chain_length,
+            previous_receiving_chain_length,
+            peer_id_map,
+            id_peer_map,
+            skipped_keys_map,
+            peer_channels,
+            dkg_ratchet,
+            next_dkg_ratchet,
+            async_dkg_ratchet: triple_ratchet_json.async_dkg_ratchet,
+            should_ratchet: triple_ratchet_json.should_ratchet,
+            should_dkg_ratchet,
+            async_dkg_pubkey,
+            threshold: triple_ratchet_json.threshold,
+        })
+    }
+
     pub fn get_peer_id_map(&self) -> HashMap<Vec<u8>, usize> {
         return self.peer_id_map.clone();
     }
@@ -197,13 +408,23 @@ impl TripleRatchetParticipant {
     pub fn initialize(&mut self, init_messages: &HashMap<Vec<u8>, P2PChannelEnvelope>) 
         -> Result<HashMap<Vec<u8>, P2PChannelEnvelope>, TripleRatchetError> {
         for (k, m) in init_messages {
-            let msg = self.peer_channels.get_mut(k).unwrap().ratchet_decrypt(m).unwrap();
-            if msg != b"init" {
+            let channel = self.peer_channels.get_mut(k);
+            if channel.is_none() {
+                return Err(TripleRatchetError::InvalidData("Invalid peer channel".into()))
+            }
+            let msg = channel.unwrap().ratchet_decrypt(m);
+            if msg.is_err() {
+              return Err(TripleRatchetError::CryptoError(msg.err().unwrap().to_string()))
+            }
+            if msg.unwrap() != b"init" {
                 return Err(TripleRatchetError::InvalidData("Invalid init message".into()));
             }
         }
 
-        self.dkg_ratchet.sample_polynomial(&mut OsRng);
+        let maybeerr = self.dkg_ratchet.sample_polynomial(&mut OsRng);
+        if maybeerr.is_err() {
+          return Err(TripleRatchetError::InvalidData(maybeerr.err().unwrap().to_string().into()))
+        }
 
         let result = self.dkg_ratchet.get_poly_frags().unwrap();
 
@@ -224,11 +445,18 @@ impl TripleRatchetParticipant {
 
     pub fn receive_poly_frag(&mut self, peer_id: &[u8], frag: &P2PChannelEnvelope) 
         -> Result<Option<HashMap<Vec<u8>, P2PChannelEnvelope>>, TripleRatchetError> {
-        let b = self.peer_channels.get_mut(peer_id).unwrap().ratchet_decrypt(frag).unwrap();
+        let channel = self.peer_channels.get_mut(peer_id);
+        if channel.is_none() {
+            return Err(TripleRatchetError::InvalidData("Invalid peer channel".into()))
+        }
+        let b = channel.unwrap().ratchet_decrypt(frag);
+        if b.is_err() {
+          return Err(TripleRatchetError::CryptoError(b.err().unwrap().to_string()))
+        }
 
         let result = self.dkg_ratchet.set_poly_frag_for_party(
             *self.peer_id_map.get(peer_id).unwrap(),
-            &b,
+            &b.unwrap(),
         ).unwrap();
 
         if result.is_some() {
@@ -246,11 +474,18 @@ impl TripleRatchetParticipant {
 
     pub fn receive_commitment(&mut self, peer_id: &[u8], zkcommit: &P2PChannelEnvelope) 
         -> Result<Option<HashMap<Vec<u8>, P2PChannelEnvelope>>, TripleRatchetError> {
-        let b = self.peer_channels.get_mut(peer_id).unwrap().ratchet_decrypt(zkcommit).unwrap();
+        let channel = self.peer_channels.get_mut(peer_id);
+        if channel.is_none() {
+            return Err(TripleRatchetError::InvalidData("Invalid peer channel".into()))
+        }
+        let b = channel.unwrap().ratchet_decrypt(zkcommit);
+        if b.is_err() {
+          return Err(TripleRatchetError::CryptoError(b.err().unwrap().to_string()))
+        }
 
         let result = self.dkg_ratchet.receive_commitments(
             *self.peer_id_map.get(peer_id).unwrap(),
-            &b,
+            &b.unwrap(),
         ).unwrap();
 
         if let Some(reveal) = result {
@@ -267,9 +502,16 @@ impl TripleRatchetParticipant {
     }
 
     pub fn recombine(&mut self, peer_id: &[u8], reveal: &P2PChannelEnvelope) -> Result<(), Box<dyn std::error::Error>> {
-        let b = self.peer_channels.get_mut(peer_id).unwrap().ratchet_decrypt(reveal).unwrap();
+        let channel = self.peer_channels.get_mut(peer_id);
+        if channel.is_none() {
+            return Err("Invalid peer channel".into())
+        }
+        let b = channel.unwrap().ratchet_decrypt(reveal);
+        if b.is_err() {
+          return Err(Box::new(TripleRatchetError::CryptoError(b.err().unwrap().to_string())))
+        }
 
-        let rev: FeldmanReveal = serde_json::from_slice(&b).unwrap();
+        let rev: FeldmanReveal = serde_json::from_slice(&b.unwrap()).unwrap();
 
         let done = self.dkg_ratchet.recombine(
             *self.peer_id_map.get(peer_id).unwrap(),

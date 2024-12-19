@@ -1,3 +1,5 @@
+use base64::prelude::*;
+use ed448_goldilocks_plus::elliptic_curve::group::GroupEncoding;
 use ed448_goldilocks_plus::elliptic_curve::ops::MulByGenerator;
 use ed448_goldilocks_plus::{subtle, CompressedEdwardsY, EdwardsPoint, Scalar};
 use rand::rngs::OsRng;
@@ -7,7 +9,9 @@ use hkdf::Hkdf;
 use aes_gcm::{Aes256Gcm, Nonce};
 use aes_gcm::aead::{Aead, Payload};
 use std::collections::HashMap;
+use std::error;
 use subtle::ConstantTimeEq;
+use serde::{Serialize, Deserialize};
 
 const DOUBLE_RATCHET_PROTOCOL_VERSION: u16 = 1;
 const DOUBLE_RATCHET_PROTOCOL: u16 = 1 << 8 + DOUBLE_RATCHET_PROTOCOL_VERSION;
@@ -16,6 +20,7 @@ const CHAIN_KEY: u8 = 0x01;
 const MESSAGE_KEY: u8 = 0x02;
 const AEAD_KEY: u8 = 0x03;
 
+#[derive(Debug)]
 pub struct DoubleRatchetParticipant {
     sending_ephemeral_private_key: Scalar,
     receiving_ephemeral_key: EdwardsPoint,
@@ -33,6 +38,24 @@ pub struct DoubleRatchetParticipant {
     skipped_keys_map: HashMap<Vec<u8>, HashMap<u32, Vec<u8>>>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct DoubleRatchetParticipantJson {
+    pub sending_ephemeral_private_key: String,
+    pub receiving_ephemeral_key: String,
+    pub root_key: String,
+    pub sending_chain_key: String,
+    pub current_sending_header_key: String,
+    pub current_receiving_header_key: String,
+    pub next_sending_header_key: String,
+    pub next_receiving_header_key: String,
+    pub receiving_chain_key: String,
+    pub current_sending_chain_length: u32,
+    pub previous_sending_chain_length: u32,
+    pub current_receiving_chain_length: u32,
+    pub previous_receiving_chain_length: u32,
+    pub skipped_keys_map: HashMap<String, HashMap<u32, String>>,
+}
+
 #[derive(Clone, Debug)]
 pub struct MessageCiphertext {
     pub ciphertext: Vec<u8>,
@@ -45,6 +68,69 @@ pub struct P2PChannelEnvelope {
     pub protocol_identifier: u16,
     pub message_header: MessageCiphertext,
     pub message_body: MessageCiphertext,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct P2PChannelEnvelopeJson {
+    pub protocol_identifier: u16,
+    pub message_header: MessageCiphertextJson,
+    pub message_body: MessageCiphertextJson,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MessageCiphertextJson {
+    pub ciphertext: String,
+    pub initialization_vector: String,
+    pub associated_data: Option<String>,
+}
+
+impl P2PChannelEnvelope {
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let envelope = P2PChannelEnvelopeJson{
+            protocol_identifier: self.protocol_identifier,
+            message_header: MessageCiphertextJson{
+                ciphertext: BASE64_STANDARD.encode(&self.message_header.ciphertext),
+                initialization_vector: BASE64_STANDARD.encode(&self.message_header.initialization_vector),
+                associated_data: self.message_header.associated_data.clone().map(|a| BASE64_STANDARD.encode(a)),
+            },
+            message_body: MessageCiphertextJson{
+                ciphertext: BASE64_STANDARD.encode(&self.message_body.ciphertext),
+                initialization_vector: BASE64_STANDARD.encode(&self.message_body.initialization_vector),
+                associated_data: self.message_body.associated_data.clone().map(|a| BASE64_STANDARD.encode(a)),
+            },
+        };
+
+        serde_json::to_string(&envelope)
+    }
+
+    pub fn from_json(envelope_json: String) -> Result<P2PChannelEnvelope, Box<dyn std::error::Error>> {
+        let envelope: Result<P2PChannelEnvelopeJson, serde_json::Error> = serde_json::from_str(&envelope_json);
+        if envelope.is_err() {
+           return Err(Box::new(envelope.unwrap_err()));
+        }
+
+        let e = envelope.unwrap();
+        let header_ciphertext = BASE64_STANDARD.decode(e.message_header.ciphertext)?;
+        let header_initialization_vector = BASE64_STANDARD.decode(e.message_header.initialization_vector)?;
+        let header_associated_data = e.message_header.associated_data.map(|a| BASE64_STANDARD.decode(a)).transpose()?;
+        let ciphertext = BASE64_STANDARD.decode(e.message_body.ciphertext)?;
+        let initialization_vector = BASE64_STANDARD.decode(e.message_body.initialization_vector)?;
+        let associated_data = e.message_body.associated_data.map(|a| BASE64_STANDARD.decode(a)).transpose()?;
+
+        Ok(P2PChannelEnvelope{
+            protocol_identifier: e.protocol_identifier,
+            message_header: MessageCiphertext{
+                ciphertext: header_ciphertext,
+                initialization_vector: header_initialization_vector,
+                associated_data: header_associated_data,
+            },
+            message_body: MessageCiphertext{
+                ciphertext: ciphertext,
+                initialization_vector: initialization_vector,
+                associated_data: associated_data,
+            },
+        })
+    }
 }
 
 impl DoubleRatchetParticipant {
@@ -94,6 +180,104 @@ impl DoubleRatchetParticipant {
         Ok(participant)
     }
 
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        let mut skipped_keys_map = HashMap::<String, HashMap<u32, String>>::new();
+        for (k, v) in &self.skipped_keys_map {
+            let kb = BASE64_STANDARD.encode(k);
+            let mut val = HashMap::<u32, String>::new();
+            for (kk, vv) in v {
+                let vvb = BASE64_STANDARD.encode(vv);
+                val.insert(*kk, vvb);
+            }
+            skipped_keys_map.insert(kb, val);
+        }
+
+        let participant = DoubleRatchetParticipantJson{
+            sending_ephemeral_private_key: BASE64_STANDARD.encode(self.sending_ephemeral_private_key.to_bytes()),
+            receiving_ephemeral_key: BASE64_STANDARD.encode(self.receiving_ephemeral_key.compress().to_bytes()),
+            root_key: BASE64_STANDARD.encode(&self.root_key),
+            sending_chain_key: BASE64_STANDARD.encode(&self.sending_chain_key),
+            current_sending_header_key: BASE64_STANDARD.encode(&self.current_sending_header_key),
+            current_receiving_header_key: BASE64_STANDARD.encode(&self.current_receiving_header_key),
+            next_sending_header_key: BASE64_STANDARD.encode(&self.next_sending_header_key),
+            next_receiving_header_key: BASE64_STANDARD.encode(&self.next_receiving_header_key),
+            receiving_chain_key: BASE64_STANDARD.encode(&self.receiving_chain_key),
+            current_sending_chain_length: self.current_sending_chain_length,
+            previous_sending_chain_length: self.previous_sending_chain_length,
+            current_receiving_chain_length: self.current_receiving_chain_length,
+            previous_receiving_chain_length: self.previous_receiving_chain_length,
+            skipped_keys_map: skipped_keys_map,
+        };
+
+        serde_json::to_string(&participant)
+    }
+
+    pub fn from_json(participant_json: String) -> Result<DoubleRatchetParticipant, Box<dyn std::error::Error>> {
+        let json: Result<DoubleRatchetParticipantJson, serde_json::Error> = serde_json::from_str(&participant_json);
+        match json {
+            Ok(participant) => {
+                let sending_ephemeral_private_key_bytes = BASE64_STANDARD.decode(participant.sending_ephemeral_private_key)?;
+                let receiving_ephemeral_key_bytes = BASE64_STANDARD.decode(participant.receiving_ephemeral_key)?;
+                let root_key = BASE64_STANDARD.decode(participant.root_key)?;
+                let sending_chain_key = BASE64_STANDARD.decode(participant.sending_chain_key)?;
+                let current_sending_header_key = BASE64_STANDARD.decode(participant.current_sending_header_key)?;
+                let current_receiving_header_key = BASE64_STANDARD.decode(participant.current_receiving_header_key)?;
+                let next_sending_header_key = BASE64_STANDARD.decode(participant.next_sending_header_key)?;
+                let next_receiving_header_key = BASE64_STANDARD.decode(participant.next_receiving_header_key)?;
+                let receiving_chain_key = BASE64_STANDARD.decode(participant.receiving_chain_key)?;
+                let current_sending_chain_length = participant.current_sending_chain_length;
+                let previous_sending_chain_length = participant.previous_sending_chain_length;
+                let current_receiving_chain_length = participant.current_receiving_chain_length;
+                let previous_receiving_chain_length = participant.previous_receiving_chain_length;
+                let mut skipped_keys_map = HashMap::<Vec<u8>, HashMap<u32, Vec<u8>>>::new();
+                for (k, v) in participant.skipped_keys_map {
+                    let kb = BASE64_STANDARD.decode(k)?;
+                    let mut val = HashMap::<u32, Vec<u8>>::new();
+                    for (kk, vv) in v {
+                        let vvb = BASE64_STANDARD.decode(vv)?;
+                        val.insert(kk, vvb);
+                    }
+                    skipped_keys_map.insert(kb, val);
+                }
+
+                if sending_ephemeral_private_key_bytes.len() != 56 || receiving_ephemeral_key_bytes.len() != 57 {
+                    Err("invalid data".into())
+                } else {
+                    let mut sending_ephemeral_private_key = [0u8; 56];
+                    sending_ephemeral_private_key.copy_from_slice(&sending_ephemeral_private_key_bytes);
+
+                    let mut receiving_ephemeral_key = [0u8; 57];
+                    receiving_ephemeral_key.copy_from_slice(&receiving_ephemeral_key_bytes);
+
+                    let receiving_ephemeral_ct = EdwardsPoint::from_bytes(&receiving_ephemeral_key.into());
+                    if receiving_ephemeral_ct.is_none().into() {
+                        Err("invalid data".into())
+                    } else {
+                        Ok(DoubleRatchetParticipant{
+                            sending_ephemeral_private_key: Scalar::from_bytes(&sending_ephemeral_private_key),
+                            receiving_ephemeral_key: receiving_ephemeral_ct.unwrap(),
+                            root_key: root_key,
+                            sending_chain_key: sending_chain_key,
+                            current_sending_header_key: current_sending_header_key,
+                            current_receiving_header_key: current_receiving_header_key,
+                            next_sending_header_key: next_sending_header_key,
+                            next_receiving_header_key: next_receiving_header_key,
+                            receiving_chain_key: receiving_chain_key,
+                            current_sending_chain_length: current_sending_chain_length,
+                            previous_sending_chain_length: previous_sending_chain_length,
+                            current_receiving_chain_length: current_receiving_chain_length,
+                            previous_receiving_chain_length: previous_receiving_chain_length,
+                            skipped_keys_map: skipped_keys_map,
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                Err(Box::new(e))
+            }
+        }
+    }
+
     pub fn ratchet_encrypt(&mut self, message: &[u8]) -> Result<P2PChannelEnvelope, Box<dyn std::error::Error>> {
         let mut envelope = P2PChannelEnvelope {
             protocol_identifier: DOUBLE_RATCHET_PROTOCOL,
@@ -124,7 +308,6 @@ impl DoubleRatchetParticipant {
         }
 
         let (header, should_ratchet) = self.decrypt_header(&envelope.message_header, &self.current_receiving_header_key)?;
-
         let (receiving_ephemeral_key, previous_receiving_chain_length, current_receiving_chain_length) = 
             self.decode_header(&header)?;
 
@@ -403,7 +586,7 @@ mod tests {
       assert_eq!(response, decrypted.as_slice());
 
       // Test multiple messages
-      for _ in 0..10 {
+      for _ in 0..5 {
           let message = b"Secure communication test";
           let envelope = alice.ratchet_encrypt(message).unwrap();
           let decrypted = bob.ratchet_decrypt(&envelope).unwrap();
@@ -415,7 +598,25 @@ mod tests {
           assert_eq!(response, decrypted.as_slice());
       }
 
-      let decrypted = bob.ratchet_decrypt(&delayed).unwrap();
+      let alice_json = alice.to_json().unwrap();
+      let bob_json = bob.to_json().unwrap();
+
+      let mut new_alice = DoubleRatchetParticipant::from_json(alice_json).unwrap();
+      let mut new_bob = DoubleRatchetParticipant::from_json(bob_json).unwrap();
+
+      // Test multiple messages
+      for _ in 0..5 {
+        let message = b"Secure communication test";
+        let envelope = new_alice.ratchet_encrypt(message).unwrap();
+        let decrypted = new_bob.ratchet_decrypt(&envelope).unwrap();
+        assert_eq!(message, decrypted.as_slice());
+
+        let response = b"Acknowledged";
+        let envelope = new_bob.ratchet_encrypt(response).unwrap();
+        let decrypted = new_alice.ratchet_decrypt(&envelope).unwrap();
+        assert_eq!(response, decrypted.as_slice());
+    }
+      let decrypted = new_bob.ratchet_decrypt(&delayed).unwrap();
       assert_eq!(b"force another step", decrypted.as_slice());
   }
 }
